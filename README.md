@@ -42,26 +42,126 @@ WoE models catch more defaults in absolute numbers because the binning directly 
 
 ---
 
+## Background: Credit Risk & Regulatory Context
+
+Under the Basel III Internal Ratings-Based (IRB) approach, banks that model their own credit risk must estimate three components for each loan:
+
+- **PD (Probability of Default)** — likelihood a borrower fails to repay within 12 months
+- **LGD (Loss Given Default)** — share of exposure lost if default occurs
+- **EAD (Exposure at Default)** — outstanding balance at the time of default
+
+Expected Credit Loss is then: **ECL = PD × LGD × EAD**
+
+IFRS 9 (effective 2018) extended this to *lifetime* ECL for stage 2 and stage 3 assets, significantly increasing the pressure on banks to produce accurate, forward-looking PD estimates. Yet Basel III's IRB approach simultaneously demands that models be interpretable and auditable — which has historically locked institutions into logistic regression scorecards. This study quantifies the predictive trade-off and frames it within that regulatory constraint.
+
+---
+
 ## Methodology
 
-**Data:** Lending Club 2007–2014 peer-to-peer loan data. Time-based split: 2007–2013 train (326,399 obs), 2014 test (139,886 obs). Default rate ~10.9% — imbalanced, making accuracy a misleading metric.
+### Data
 
-**Feature engineering:** 22 variables selected by Information Value (IV) from 150+ raw features. For logistic models: continuous variables discretized into WoE-scored bins. For ML models: one-hot encoding + partial WoE grouping for variables with missing values.
+Lending Club 2007–2014 peer-to-peer loan data. The train/test split is **time-based** (not random): 2007–2013 for training (326,399 obs) and 2014 for testing (139,886 obs). This mimics real-world model validation, where a model trained on historical data is applied to future unseen loans. Default rate is ~10.9%, making the dataset imbalanced — standard accuracy is therefore a misleading metric.
 
-**Hyperparameter optimization:** Optuna (Bayesian, TPE sampler, 75 trials) for XGBoost, LightGBM, CatBoost, Random Forest.
+### Feature Selection via Information Value (IV)
+
+From 150+ raw features, 22 variables were selected using **Information Value (IV)**, which measures how well a variable distinguishes defaulters from non-defaulters:
+
+$$IV = \sum_{i=1}^{n} \left( \%\text{Good}_i - \%\text{Bad}_i \right) \times \ln\left(\frac{\%\text{Good}_i}{\%\text{Bad}_i}\right)$$
+
+where each bin $i$ contributes proportionally to how different its share of good (non-default) and bad (default) borrowers is. The standard interpretation:
+
+| IV | Predictive Power |
+|----|-----------------|
+| < 0.02 | Useless |
+| 0.02 – 0.1 | Weak |
+| 0.1 – 0.3 | Medium |
+| 0.3 – 0.5 | Strong |
+| > 0.5 | Suspicious (may indicate data leakage) |
+
+Top features by IV: `int_rate` (interest rate), `last_pymnt_amnt` (last payment amount), `total_rec_prncp` (principal received), `out_prncp` (outstanding principal), `installment`.
+
+### Weight of Evidence (WoE) Preprocessing
+
+For logistic regression models, continuous variables are **discretized into bins** and each bin is replaced by its Weight of Evidence score:
+
+$$WoE_i = \ln\left(\frac{\%\text{Good}_i}{\%\text{Bad}_i}\right)$$
+
+This transformation has three practical advantages for credit risk:
+1. It linearizes the relationship between each predictor and the log-odds of default, which satisfies the assumption of logistic regression.
+2. It handles missing values naturally — missing data becomes its own bin with its own WoE score.
+3. The resulting model coefficients are directly interpretable as a **scorecard**: each variable's contribution to the default probability is explicit and auditable, which satisfies Basel III documentation requirements.
+
+For ML models (XGBoost, CatBoost, etc.), WoE binning was applied only to variables with significant missing values; all other variables were one-hot encoded.
+
+### Hyperparameter Optimization
+
+All ensemble models were tuned with **Optuna** (Bayesian optimization, Tree-structured Parzen Estimator sampler, 75 trials):
 
 | Model | Method | Key Hyperparameters |
 |-------|--------|---------------------|
 | LASSO | GridSearchCV (5-fold) | C = 0.01 |
 | LightGBM | Optuna | max_depth=6, n_est=565, lr=1e-8 |
-| CART | Optuna | max_depth=3, max_features=4 |
+| Decision Tree | Optuna | max_depth=3, max_features=4 |
 | Random Forest | Optuna | n_est=100, max_features=6 |
 | XGBoost | Optuna | max_depth=5, n_est=348, lr=0.007 |
 | CatBoost | Optuna | max_depth=2, n_est=589, lr=0.019 |
 
-**Classification threshold:** p ≥ 0.80 → Non-Default. Conservative threshold reflecting credit risk practice where the cost of missing a default exceeds the cost of rejecting a good borrower.
+**Classification threshold:** p ≥ 0.80 → Non-Default. This conservative threshold reflects credit risk practice: missing a true default (false negative) is far more costly than rejecting a creditworthy borrower (false positive).
 
-**Metrics:** AUC · GINI (= 2·AUC − 1) · Kolmogorov-Smirnov · Brier Score · Precision · Recall · F1
+---
+
+## Evaluation Metrics
+
+### ROC AUC
+
+The **Receiver Operating Characteristic** curve plots the True Positive Rate (TPR) against the False Positive Rate (FPR) at every classification threshold. The **Area Under the Curve (AUC)** summarizes this in a single number:
+
+- AUC = 0.5 → random classifier (no discrimination)
+- AUC = 1.0 → perfect classifier
+- In credit risk, AUC > 0.65 is generally considered acceptable; > 0.70 is strong.
+
+$$\text{TPR (Recall)} = \frac{TP}{TP + FN}, \quad \text{FPR} = \frac{FP}{FP + TN}$$
+
+### GINI Coefficient
+
+A rescaling of AUC that maps [0.5, 1.0] → [0, 1], making it easier to compare models in a credit risk context:
+
+$$\text{GINI} = 2 \times \text{AUC} - 1$$
+
+XGBoost achieves GINI = 0.404, meaning it correctly ranks ~40% more borrower pairs by default risk than a random model.
+
+### Kolmogorov-Smirnov (KS) Statistic
+
+The **KS statistic** measures the maximum separation between the cumulative distribution of predicted scores for defaulters vs. non-defaulters:
+
+$$KS = \max_t \left| F_{\text{bad}}(t) - F_{\text{good}}(t) \right|$$
+
+where $F_{\text{bad}}(t)$ and $F_{\text{good}}(t)$ are the CDFs of predicted default probabilities for bad and good borrowers respectively. KS is widely used in banking model validation:
+
+| KS | Discriminatory Power |
+|----|---------------------|
+| < 0.20 | Poor |
+| 0.20 – 0.40 | Acceptable |
+| 0.40 – 0.60 | Good |
+| > 0.60 | Very good (may indicate overfitting) |
+
+XGBoost achieves KS = 0.298, placing it in the acceptable-to-good range.
+
+### Brier Score
+
+The **Brier Score** measures the mean squared error of predicted probabilities against actual binary outcomes:
+
+$$BS = \frac{1}{N} \sum_{i=1}^{N} \left(\hat{p}_i - y_i\right)^2$$
+
+where $\hat{p}_i$ is the predicted default probability and $y_i \in \{0, 1\}$ is the true label. Lower is better. A score of 0 is perfect; a naïve model predicting the base rate always achieves BS ≈ 0.097 on this dataset (10.9% default rate). All models beat the naïve baseline.
+
+### Precision, Recall, F1
+
+At the chosen threshold (p < 0.80 → predicted default):
+
+$$\text{Precision} = \frac{TP}{TP + FP}, \quad \text{Recall} = \frac{TP}{TP + FN}, \quad F_1 = \frac{2 \times \text{Precision} \times \text{Recall}}{\text{Precision} + \text{Recall}}$$
+
+Because the dataset is imbalanced (~10.9% defaults), F1 and Recall are more informative than accuracy. The WoE-based models achieve significantly higher Recall at this threshold — they catch more actual defaults — because WoE binning explicitly codes the borrower risk tiers that the conservative threshold targets.
 
 ---
 
@@ -77,7 +177,7 @@ WoE models catch more defaults in absolute numbers because the binning directly 
 | Features used | 22 (selected by IV) |
 | Split | Time-based (not random) |
 
-> **Data note:** The preprocessed training feature matrix (~300MB) is not included. The test feature matrix (`data/ml/X_test.csv`, 35MB, 93 features) and target vectors are available. Full preprocessing code is in the notebook.
+> **Data note:** The preprocessed training feature matrix (~300MB) is not included in this repo. The test feature matrix (`data/ml/X_test.csv`, 35MB, 93 features) and target vector are available. Full preprocessing code is in the notebook.
 
 ---
 
@@ -113,12 +213,6 @@ jupyter notebook notebooks/ml_models_comparison.ipynb
 ```
 
 > Download the raw Lending Club data from Kaggle and run the preprocessing cells to regenerate the training features. The notebook contains the full feature engineering pipeline.
-
----
-
-## Context
-
-IFRS 9 (2018) introduced lifetime expected credit loss requirements, increasing pressure on banks to improve PD model accuracy. Yet Basel III's IRB approach still demands interpretable, auditable models — which has historically locked institutions into logistic regression scorecards. This study quantifies the predictive trade-off and frames it within the regulatory constraint, contributing to the active debate on ML adoption in credit risk management.
 
 ---
 
